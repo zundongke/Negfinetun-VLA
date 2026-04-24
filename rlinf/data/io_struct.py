@@ -1410,6 +1410,106 @@ class EmbodiedRolloutResult:
 
 
 @dataclass(kw_only=True)
+class OARStepResult:
+    """One chunk-step of (observation, executed_action, reward) for offline persistence.
+
+    Captured atomically at each chunk step in the rollout worker, alongside
+    ChunkStepResult. Tokenizer-agnostic: task_descriptions are raw strings,
+    no prev_logprobs / values / flow-matching chain fields.
+    """
+    # observation
+    main_images: torch.Tensor                    # [B, V, H, W, 3] uint8
+    state: torch.Tensor                          # [B, state_dim] fp32
+    task_descriptions: list[str]                 # length B
+    wrist_images: Optional[torch.Tensor] = None  # [B, V, H, W, 3] uint8 or None
+    # action (post-intervene, matches forward_inputs["action"])
+    executed_action: torch.Tensor = None         # [B, H, action_dim] fp32
+    # reward / termination — per env sub-step inside the chunk
+    reward: torch.Tensor = None                  # [B, H] fp32
+    done: torch.Tensor = None                    # [B, H] bool
+    terminations: torch.Tensor = None            # [B, H] bool
+    truncations: torch.Tensor = None             # [B, H] bool
+    # auxiliary
+    task_ids: Optional[torch.Tensor] = None      # [B] int64
+    success_once: Optional[torch.Tensor] = None  # [B] bool
+
+    def __post_init__(self):
+        if torch.is_tensor(self.main_images):
+            self.main_images = self.main_images.cpu().contiguous()
+        if self.wrist_images is not None and torch.is_tensor(self.wrist_images):
+            self.wrist_images = self.wrist_images.cpu().contiguous()
+        if torch.is_tensor(self.state):
+            self.state = self.state.cpu().contiguous()
+        if self.executed_action is not None:
+            self.executed_action = self.executed_action.cpu().contiguous()
+        if self.reward is not None:
+            self.reward = self.reward.cpu().contiguous()
+        if self.done is not None:
+            self.done = self.done.cpu().contiguous()
+        if self.terminations is not None:
+            self.terminations = self.terminations.cpu().contiguous()
+        if self.truncations is not None:
+            self.truncations = self.truncations.cpu().contiguous()
+        if self.task_ids is not None and torch.is_tensor(self.task_ids):
+            self.task_ids = self.task_ids.cpu().contiguous()
+        if self.success_once is not None and torch.is_tensor(self.success_once):
+            self.success_once = self.success_once.cpu().contiguous()
+
+
+@dataclass(kw_only=True)
+class OARRolloutBuffer:
+    """Per-stage buffer aggregating OARStepResult over one rollout epoch.
+
+    Each list is stacked on dim=0 (time axis T = n_chunk_steps) in to_dict().
+    """
+    main_images: list[torch.Tensor] = field(default_factory=list)
+    wrist_images: list[Optional[torch.Tensor]] = field(default_factory=list)
+    state: list[torch.Tensor] = field(default_factory=list)
+    task_descriptions: list[list[str]] = field(default_factory=list)
+    executed_action: list[torch.Tensor] = field(default_factory=list)
+    reward: list[torch.Tensor] = field(default_factory=list)
+    done: list[torch.Tensor] = field(default_factory=list)
+    terminations: list[torch.Tensor] = field(default_factory=list)
+    truncations: list[torch.Tensor] = field(default_factory=list)
+    task_ids: list[Optional[torch.Tensor]] = field(default_factory=list)
+    success_once: list[Optional[torch.Tensor]] = field(default_factory=list)
+
+    def append(self, step: "OARStepResult") -> None:
+        self.main_images.append(step.main_images)
+        self.wrist_images.append(step.wrist_images)
+        self.state.append(step.state)
+        self.task_descriptions.append(step.task_descriptions)
+        self.executed_action.append(step.executed_action)
+        self.reward.append(step.reward)
+        self.done.append(step.done)
+        self.terminations.append(step.terminations)
+        self.truncations.append(step.truncations)
+        self.task_ids.append(step.task_ids)
+        self.success_once.append(step.success_once)
+
+    def to_dict(self) -> dict[str, Any]:
+        def _stack_or_none(xs):
+            if len(xs) == 0 or any(x is None for x in xs):
+                return None
+            return torch.stack(xs, dim=0).contiguous()
+
+        out: dict[str, Any] = {
+            "main_images": _stack_or_none(self.main_images),
+            "wrist_images": _stack_or_none(self.wrist_images),
+            "state": _stack_or_none(self.state),
+            "task_descriptions": self.task_descriptions,  # nested list, [T][B] of str
+            "executed_action": _stack_or_none(self.executed_action),
+            "reward": _stack_or_none(self.reward),
+            "done": _stack_or_none(self.done),
+            "terminations": _stack_or_none(self.terminations),
+            "truncations": _stack_or_none(self.truncations),
+            "task_ids": _stack_or_none(self.task_ids),
+            "success_once": _stack_or_none(self.success_once),
+        }
+        return out
+
+
+@dataclass(kw_only=True)
 class AsyncEmbodiedRolloutBuffer:
     prev_logprobs: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)
     prev_values: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)

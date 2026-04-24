@@ -32,3 +32,9 @@ openpi:
   value_after_vlm: False
   value_vlm_mode: "mean_token"
   detach_critic_input: null
+  # Action-conditioning: adds a_cond token block before the action tokens.
+  # Zero-init of action_cond_in_proj makes the feature dormant at load-time,
+  # so existing SFT checkpoints produce bit-for-bit baseline output until trained.
+  action_cond_enabled: true        # false => skip the extra tokens entirely (kill-switch)
+  action_cond_dropout_prob: 0.5    # CFG-style dropout on a_cond during training
+  refine_iters: 0                  # 0 => one pass; N>0 => N refinement passes at inference

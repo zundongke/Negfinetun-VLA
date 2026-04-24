@@ -14,6 +14,8 @@
 
 import copy
 import gc
+import json
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -21,7 +23,12 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
 
 from rlinf.config import SupportedModel
-from rlinf.data.io_struct import ChunkStepResult, EmbodiedRolloutResult
+from rlinf.data.io_struct import (
+    ChunkStepResult,
+    EmbodiedRolloutResult,
+    OARRolloutBuffer,
+    OARStepResult,
+)
 from rlinf.models import get_model
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.metric_utils import compute_split_num
@@ -54,6 +61,21 @@ class MultiStepRolloutWorker(Worker):
         self._sync_weight_comm_options = CollectiveGroupOptions(
             accel_max_ctas=max_ctas, accel_min_ctas=min_ctas
         )
+
+        # Offline (o, a, r) collection config (see spec 2026-04-24 §4.8)
+        offline_cfg = cfg.rollout.get("offline_save", None)
+        self.offline_save_enabled = bool(
+            offline_cfg.get("enabled", False) if offline_cfg is not None else False
+        )
+        self.offline_save_dir = (
+            str(offline_cfg.get("output_dir", "./data/rollouts"))
+            if offline_cfg is not None
+            else "./data/rollouts"
+        )
+        self.offline_save_start_step = int(
+            offline_cfg.get("start_step", 0) if offline_cfg is not None else 0
+        )
+        self._global_step = 0
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -220,6 +242,71 @@ class MultiStepRolloutWorker(Worker):
                 raise NotImplementedError(f"{forward_inputs.keys()=}")
         return forward_inputs
 
+    def _append_oar_step(
+        self,
+        *,
+        stage_id: int,
+        env_output: dict,
+        extracted_obs: dict,
+        actions: Any,
+        rewards: Any,
+        dones: Any,
+    ) -> None:
+        """Build an OARStepResult from the current chunk step and append to the per-stage buffer.
+
+        Uses raw env_output.obs (images, state, task_descriptions) to stay
+        tokenizer-agnostic. See spec 2026-04-24 §4.3.
+        """
+        obs = env_output["obs"]
+
+        main_images = obs.get("main_images")
+        if main_images is not None and not torch.is_tensor(main_images):
+            main_images = torch.as_tensor(main_images)
+
+        wrist_images = obs.get("wrist_images")
+        if wrist_images is not None and not torch.is_tensor(wrist_images):
+            wrist_images = torch.as_tensor(wrist_images)
+
+        state = obs.get("states")
+        if state is not None and not torch.is_tensor(state):
+            state = torch.as_tensor(state)
+
+        task_descriptions = obs.get("task_descriptions")
+        task_descriptions = list(task_descriptions) if task_descriptions is not None else []
+
+        # actions comes from predict() — possibly numpy, possibly [B, H*ad] or [B, H, ad]
+        act = actions
+        if not torch.is_tensor(act):
+            act = torch.as_tensor(act)
+        H = int(self.cfg.actor.model.num_action_chunks)
+        action_dim = int(self.cfg.actor.model.action_dim)
+        if act.dim() == 2 and act.shape[1] == H * action_dim:
+            act = act.reshape(act.shape[0], H, action_dim)
+        act = act.to(dtype=torch.float32)
+
+        # First reset step has rewards=None; represent as zeros so stacking works.
+        if rewards is None:
+            bsz = state.shape[0] if state is not None else act.shape[0]
+            r = torch.zeros((bsz, H), dtype=torch.float32)
+        else:
+            r = rewards if torch.is_tensor(rewards) else torch.as_tensor(rewards)
+            r = r.to(dtype=torch.float32)
+
+        step = OARStepResult(
+            main_images=main_images,
+            wrist_images=wrist_images,
+            state=state,
+            task_descriptions=task_descriptions,
+            executed_action=act,
+            reward=r,
+            done=dones,
+            terminations=env_output.get("terminations"),
+            truncations=env_output.get("truncations"),
+            task_ids=env_output.get("task_ids"),
+            success_once=env_output.get("success_once"),
+        )
+        self.oar_buffer_list[stage_id].append(step)
+
     async def generate(
         self, input_channel: Channel, output_channel: Channel, actor_channel: Channel
     ):
@@ -230,6 +317,15 @@ class MultiStepRolloutWorker(Worker):
             EmbodiedRolloutResult(rollout_epoch=self.cfg.algorithm.rollout_epoch)
             for _ in range(self.num_pipeline_stages)
         ]
+
+        # Offline (o, a, r) collection runs alongside the PPO/NFT buffer.
+        # See spec 2026-04-24 §4.2.
+        if self.offline_save_enabled:
+            self.oar_buffer_list = [
+                OARRolloutBuffer() for _ in range(self.num_pipeline_stages)
+            ]
+        else:
+            self.oar_buffer_list = []
 
         n_chunk_steps = (
             self.cfg.env.train.max_steps_per_rollout_epoch
@@ -289,6 +385,18 @@ class MultiStepRolloutWorker(Worker):
                         self.buffer_list[stage_id].add_transition(
                             last_extracted_obs[stage_id], real_extracted_obs
                         )
+
+                    # Atomic (o, a, r) capture for offline persistence (spec §4).
+                    if self.offline_save_enabled:
+                        self._append_oar_step(
+                            stage_id=stage_id,
+                            env_output=env_output,
+                            extracted_obs=extracted_obs,
+                            actions=actions,
+                            rewards=rewards,
+                            dones=dones,
+                        )
+
                     last_extracted_obs[stage_id] = extracted_obs
                     last_forward_inputs[stage_id] = result["forward_inputs"]
 
@@ -336,6 +444,10 @@ class MultiStepRolloutWorker(Worker):
 
         for i in range(self.num_pipeline_stages):
             self.send_rollout_batch(actor_channel, i)
+
+        # Offline (o, a, r) shards written after the in-memory PPO buffer has
+        # been handed off to the actor. See spec 2026-04-24 §4.5.
+        self._save_oar_shards()
 
         if self.enable_offload:
             self.offload_model()
@@ -403,5 +515,69 @@ class MultiStepRolloutWorker(Worker):
         return split_num
 
     def set_global_step(self, global_step):
+        self._global_step = int(global_step)
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)
+
+    def _save_oar_shards(self) -> None:
+        """Persist the per-stage OAR buffers to disk, one shard per (rank, stage).
+
+        One shard per rollout-rank per pipeline stage under
+        ``{output_dir}/global_step_{N}/``. Rank 0 additionally writes a small
+        ``metadata.json`` describing shapes and dtypes. Never raises — disk
+        errors are logged and swallowed to keep the training loop alive.
+        """
+        if not self.offline_save_enabled:
+            return
+        if self._global_step < self.offline_save_start_step:
+            return
+        if not hasattr(self, "oar_buffer_list") or not self.oar_buffer_list:
+            return
+
+        out_dir = Path(self.offline_save_dir) / f"global_step_{self._global_step}"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"[rollout_worker] offline_save: mkdir {out_dir} failed: {e}", flush=True)
+            return
+
+        example_dict = None
+        for stage_id, buf in enumerate(self.oar_buffer_list):
+            shard_path = out_dir / f"rank_{self._rank}_stage_{stage_id}.pt"
+            try:
+                payload = buf.to_dict()
+                torch.save(payload, shard_path)
+                if example_dict is None:
+                    example_dict = payload
+            except (OSError, RuntimeError) as e:
+                print(
+                    f"[rollout_worker] offline_save: write {shard_path} failed: {e}",
+                    flush=True,
+                )
+
+        if self._rank == 0 and example_dict is not None:
+            try:
+                meta = {
+                    "global_step": self._global_step,
+                    "world_size": self.placement.get_world_size("rollout"),
+                    "pipeline_stage_num": self.num_pipeline_stages,
+                    "action_dim": int(self.cfg.actor.model.action_dim),
+                    "num_action_chunks": int(self.cfg.actor.model.num_action_chunks),
+                    "shapes": {
+                        k: (
+                            list(v.shape) if torch.is_tensor(v) else None
+                        )
+                        for k, v in example_dict.items()
+                    },
+                    "dtypes": {
+                        k: str(v.dtype) if torch.is_tensor(v) else None
+                        for k, v in example_dict.items()
+                    },
+                }
+                with (out_dir / "metadata.json").open("w") as f:
+                    json.dump(meta, f, indent=2)
+            except OSError as e:
+                print(
+                    f"[rollout_worker] offline_save: metadata.json failed: {e}",
+                    flush=True,
+                )

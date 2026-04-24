@@ -24,7 +24,11 @@ import torch
 from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.models.pi0_config import Pi0Config
-from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
+from openpi.models_pytorch.pi0_pytorch import (
+    PI0Pytorch,
+    create_sinusoidal_pos_embedding,
+    make_att_2d_masks,
+)
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules import action_solvers
@@ -91,6 +95,11 @@ class OpenPi0Config(Pi0Config):
     value_after_vlm: bool = False  # value after vlm, pi05 mode
     value_vlm_mode: str = "mean_token"  # last_token, mean_token, first_token
 
+    # action conditioning (a_cond port on the expert; see design spec 2026-04-24)
+    action_cond_enabled: bool = True     # register action_cond_in_proj + emit a_cond tokens
+    action_cond_dropout_prob: float = 0.5  # CFG-style dropout of a_cond during training
+    refine_iters: int = 0                # inference refinement iterations (0 => legacy single pass)
+
     def __post_init__(self):
         super_post_init = getattr(super(), "__post_init__", None)
         if callable(super_post_init):
@@ -132,6 +141,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return [
             "action_in_proj",
             "action_out_proj",
+            "action_cond_in_proj",  # a_cond port (optional; present iff action_cond_enabled)
             "lm_head",
             # --pi0 only--
             "state_proj",
@@ -196,6 +206,20 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 dtype=self.action_out_proj.weight.dtype
             )
 
+        # a_cond projection (zero-init for bit-for-bit fallback; see spec 2026-04-24 §3.3)
+        if getattr(self.config, "action_cond_enabled", True):
+            import torch.nn as _nn
+            action_expert_width = self.action_in_proj.weight.shape[0]
+            self.action_cond_in_proj = _nn.Linear(
+                self.config.action_dim, action_expert_width
+            )
+            _nn.init.zeros_(self.action_cond_in_proj.weight)
+            _nn.init.zeros_(self.action_cond_in_proj.bias)
+            self.action_cond_in_proj = self.action_cond_in_proj.to(
+                dtype=self.action_in_proj.weight.dtype,
+                device=self.action_in_proj.weight.device,
+            )
+
         for name, module in self.named_modules():
             # Set _fsdp_wrap_name to the last part of the path (e.g., "model.action_in_proj" -> "action_in_proj")
             path_parts = name.split(".")
@@ -203,6 +227,24 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     def set_global_step(self, global_step):
         self.global_step = global_step
+
+    def _sample_action_cond(self, clean_action: torch.Tensor) -> torch.Tensor:
+        """CFG-style dropout producing the a_cond input for a training forward.
+
+        With probability ``action_cond_dropout_prob`` (per sample in the batch),
+        zero out the a_cond; otherwise use ``clean_action.detach()``.
+        At eval time (``self.training==False``) or when dropout_prob<=0, always
+        return the clean action (no randomization).
+        See spec 2026-04-24 §3.5.
+        """
+        dropout_prob = float(getattr(self.config, "action_cond_dropout_prob", 0.5))
+        a = clean_action.detach()
+        if not self.training or dropout_prob <= 0.0:
+            return a
+        drop = torch.rand(a.shape[0], device=a.device) < dropout_prob
+        while drop.dim() < a.dim():
+            drop = drop.unsqueeze(-1)
+        return torch.where(drop, torch.zeros_like(a), a)
 
     def _validate_solver_config(self):
         solver_type = (self.config.solver_type or self.config.noise_method).lower()
@@ -467,12 +509,24 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
 
         compute_values = kwargs.get("compute_values", False)
+        # a_cond: prefer explicit x_0 if provided, else derive from chains
+        action_cond_nft = None
+        if getattr(self.config, "action_cond_enabled", True):
+            clean_action = None
+            if explicit_inputs is not None and "x_0" in explicit_inputs:
+                clean_action = explicit_inputs["x_0"]
+            elif "chains" in data:
+                clean_action = data["chains"][:, -1].to(device)
+            if clean_action is not None:
+                action_cond_nft = self._sample_action_cond(clean_action)
+
         v_theta, suffix_out = self.get_velocity(
             state,
             x_t,
             t,
             prefix_pad_masks,
             past_key_values,
+            action_cond=action_cond_nft,
         )
         v_theta = v_theta[:, : self.config.action_chunk, :]
 
@@ -584,9 +638,23 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             processed_obs
         )  # obs precision processor
         observation = _model.Observation.from_dict(processed_obs)
-        outputs = self.sample_actions(
-            observation, mode=mode, compute_values=compute_values
-        )
+        refine_iters = int(getattr(self.config, "refine_iters", 0))
+        if refine_iters > 0 and getattr(self.config, "action_cond_enabled", True):
+            # Cold pass first (a_cond=None => zeros inside embed_suffix), then refine.
+            outputs = self.sample_actions(
+                observation, mode=mode, compute_values=compute_values
+            )
+            for _ in range(refine_iters):
+                outputs = self.sample_actions(
+                    observation,
+                    mode=mode,
+                    compute_values=compute_values,
+                    action_cond=outputs["actions"].detach(),
+                )
+        else:
+            outputs = self.sample_actions(
+                observation, mode=mode, compute_values=compute_values
+            )
         actions = self.output_transform(
             {"actions": outputs["actions"], "state": observation.state}
         )["actions"].numpy()
@@ -629,8 +697,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         noise=None,
         mode="train",
         compute_values=True,
+        action_cond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors).
+
+        ``action_cond`` (optional) is a clean action chunk used as the a_cond input
+        for every denoising step (see spec 2026-04-24 §3.6). None => zeros (cold start).
+        """
         bsize = observation.state.shape[0]
         device = observation.state.device
         num_steps = self.config.num_steps
@@ -709,6 +782,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     t_input,
                     prefix_pad_masks,
                     past_key_values,
+                    action_cond=action_cond,
                 )
                 if collect_flow_snap and flow_rand_idx is not None:
                     mask = flow_rand_idx == idx
@@ -806,6 +880,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 sample_mode,
                 num_steps,
                 compute_values,
+                action_cond=action_cond,
             )
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
@@ -946,10 +1021,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         mode,
         denoise_steps,
         compute_values=True,
+        action_cond: Optional[torch.Tensor] = None,
     ):
         """
         Sample the mean, variance and value of the action at a given timestep.
         Rollout sample (idx is int) and actor get_log_prob_value (idx is tensor) will load this function.
+
+        ``action_cond``: optional clean-action conditioning for the a_cond port.
         """
         # expand the shape
         bsize = state.shape[0]
@@ -967,7 +1045,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             x_t,
             timesteps[idx_tensor],
             prefix_pad_masks,
-            past_key_values
+            past_key_values,
+            action_cond=action_cond,
         )
         
         # value prediction
@@ -1021,6 +1100,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         timestep,
         prefix_pad_masks,
         past_key_values,
+        action_cond=None,
     ):
         suffix_out = self.get_suffix_out(
             state,
@@ -1028,6 +1108,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             past_key_values,
             x_t,
             timestep,
+            action_cond=action_cond,
         )
         v_t = self.action_out_proj(
             suffix_out.to(dtype=self.action_out_proj.weight.dtype)
@@ -1041,10 +1122,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         past_key_values,
         x_t,
         timestep,
+        action_cond=None,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        """Apply one denoising step of the noise `x_t` at a given timestep.
+
+        If the model has action_cond enabled and ``action_cond`` is not None,
+        an extra H-token block is inserted into the suffix (see spec 2026-04-24 §3.2).
+        When None, the suffix is byte-for-byte equivalent to the pre-change layout.
+        """
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
-            self.embed_suffix(state, x_t, timestep)
+            self.embed_suffix(state, x_t, timestep, action_cond=action_cond)
         )
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -1081,6 +1168,118 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return suffix_out
+
+    def embed_suffix(self, state, noisy_actions, timestep, action_cond=None):
+        """Override upstream PI0Pytorch.embed_suffix to insert an a_cond token block.
+
+        Layout (see spec 2026-04-24 §3.2):
+          pi0    : [state(1) | a_cond(H) | action_time(H)]
+          pi05   : [a_cond(H) | action(H)]  with adaRMS time cond
+
+        Semantics:
+          - action_cond_enabled=False: delegate to the parent (baseline behavior).
+          - action_cond_enabled=True, action_cond=None: emit H zero tokens (cold start).
+          - action_cond_enabled=True, action_cond=tensor: project through
+            action_cond_in_proj. a_cond block does NOT attend to action_time (one-way).
+        """
+        import torch.nn.functional as F
+
+        if not getattr(self.config, "action_cond_enabled", True):
+            return super().embed_suffix(state, noisy_actions, timestep)
+
+        embs: list[torch.Tensor] = []
+        pad_masks: list[torch.Tensor] = []
+        att_masks: list[int] = []
+
+        # --- state block (pi0 only) ---
+        if not self.pi05:
+            if self.state_proj.weight.dtype == torch.float32:
+                state = state.to(torch.float32)
+
+            def state_proj_func(s):
+                return self.state_proj(s)
+
+            state_emb = self._apply_checkpoint(state_proj_func, state)
+            embs.append(state_emb[:, None, :])
+            bsize = state_emb.shape[0]
+            device = state_emb.device
+            pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+            att_masks += [1]
+
+        # --- a_cond block (new) ---
+        if action_cond is None:
+            action_cond = torch.zeros_like(noisy_actions)
+        elif action_cond.shape != noisy_actions.shape:
+            raise ValueError(
+                f"action_cond shape {tuple(action_cond.shape)} must match "
+                f"noisy_actions shape {tuple(noisy_actions.shape)}"
+            )
+        if self.action_cond_in_proj.weight.dtype == torch.float32 and action_cond.dtype != torch.float32:
+            action_cond = action_cond.to(torch.float32)
+
+        def acond_proj_func(a):
+            return self.action_cond_in_proj(a)
+
+        a_cond_emb = self._apply_checkpoint(acond_proj_func, action_cond)
+        embs.append(a_cond_emb)
+        bsize_acond, acond_len = a_cond_emb.shape[:2]
+        pad_masks.append(
+            torch.ones(bsize_acond, acond_len, dtype=torch.bool, device=a_cond_emb.device)
+        )
+        # a_cond starts its own attention block, H tokens
+        att_masks += [1] + ([0] * (self.config.action_horizon - 1))
+
+        # --- timestep + action block (mirrors upstream embed_suffix) ---
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep,
+            self.action_in_proj.out_features,
+            min_period=4e-3,
+            max_period=4.0,
+            device=timestep.device,
+        )
+        time_emb = time_emb.type(dtype=timestep.dtype)
+
+        def action_proj_func(x):
+            return self.action_in_proj(x)
+
+        action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
+
+        if not self.pi05:
+            time_emb_exp = time_emb[:, None, :].expand_as(action_emb)
+            action_time_emb = torch.cat([action_emb, time_emb_exp], dim=2)
+
+            def mlp_func(ate):
+                x = self.action_time_mlp_in(ate)
+                x = F.silu(x)
+                return self.action_time_mlp_out(x)
+
+            action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
+            adarms_cond = None
+        else:
+            def time_mlp_func(te):
+                x = self.time_mlp_in(te)
+                x = F.silu(x)
+                x = self.time_mlp_out(x)
+                return F.silu(x)
+
+            time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
+            action_time_emb = action_emb
+            adarms_cond = time_emb
+
+        embs.append(action_time_emb)
+        bsize, action_time_dim = action_time_emb.shape[:2]
+        pad_masks.append(
+            torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
+        )
+        # action_time starts its own attention block, H tokens
+        att_masks += [1] + ([0] * (self.config.action_horizon - 1))
+
+        embs_cat = torch.cat(embs, dim=1)
+        pad_masks_cat = torch.cat(pad_masks, dim=1)
+        att_masks_t = torch.tensor(att_masks, dtype=embs_cat.dtype, device=embs_cat.device)
+        att_masks_t = att_masks_t[None, :].expand(bsize, len(att_masks))
+
+        return embs_cat, pad_masks_cat, att_masks_t, adarms_cond
 
     # TODO: to check potential nan here
     def get_logprob_norm(self, sample, mu, sigma):
@@ -1135,6 +1334,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         chains_values = []
         chains_entropy = []
 
+        # a_cond for training: CFG-style dropout on the clean chain endpoint
+        action_cond_train = None
+        if getattr(self.config, "action_cond_enabled", True):
+            action_cond_train = self._sample_action_cond(chains[:, -1])
+
         # get log prob
         if self.config.joint_logprob:
             num_steps = self.config.num_steps
@@ -1161,6 +1365,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 "train",
                 self.config.num_steps,
                 compute_values,
+                action_cond=action_cond_train,
             )
             log_probs = self.get_logprob_norm(chains_next, x_t_mean, x_t_std)
             entropy = self.gaussian_entropy(x_t_std)
