@@ -1587,7 +1587,105 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         self.model,
                         is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
                     )
-                    if self.cfg.algorithm.loss_type.startswith("nft"):
+                    if self.cfg.algorithm.loss_type.startswith("diffusion-nft"):
+                        # === DiffusionNFT episode-wise loss path ===
+                        # See spec docs/superpowers/specs/2026-04-25-diffusion-nft-loss-design.md
+                        from openpi.models import model as _model_lib  # local to keep dispatch dependency-free
+                        dnft_cfg = self.cfg.algorithm.get("diffusion_nft", {})
+                        beta = float(dnft_cfg.get("beta", 0.5))
+                        kl_beta = float(dnft_cfg.get("kl_beta", 1e-4))
+                        adv_clip_max = float(
+                            dnft_cfg.get("adv_clip_max", self.cfg.algorithm.get("clip_ratio_high", 1.0))
+                        )
+                        ref_mode = str(dnft_cfg.get("reference_mode", "v_old"))
+                        if ref_mode == "lora_disable" and not bool(
+                            getattr(self.cfg.actor.model, "is_lora", False)
+                        ):
+                            raise ValueError(
+                                "diffusion_nft.reference_mode='lora_disable' requires "
+                                "actor.model.is_lora=true."
+                            )
+
+                        # Build x_0 from the committed action chunk on the wire.
+                        H = int(self.cfg.actor.model.num_action_chunks)
+                        action_dim = int(self.cfg.actor.model.action_dim)
+                        x_0_flat = data["action"]
+                        if x_0_flat.dim() == 2 and x_0_flat.shape[1] == H * action_dim:
+                            x_0 = x_0_flat.reshape(x_0_flat.shape[0], H, action_dim)
+                        else:
+                            x_0 = x_0_flat.reshape(-1, H, action_dim)
+                        x_0 = x_0.to(dtype=torch.float32)
+                        bsz = x_0.shape[0]
+
+                        # Fresh forward-process noising: t ~ U(eps, 1-eps), x_t = (1-t)·x_0 + t·noise
+                        eps = 1e-3
+                        t_sample = (
+                            torch.rand((bsz,), device=x_0.device, dtype=x_0.dtype)
+                            * (1.0 - 2 * eps)
+                            + eps
+                        )
+                        noise = torch.randn_like(x_0)
+                        t_bc = t_sample.view(-1, 1, 1)
+                        x_t = (1.0 - t_bc) * x_0 + t_bc * noise
+
+                        # Build observation once; reuse for the three forwards.
+                        # The model's input_transform expects the same dict keys as forward_nft.
+                        observation_dict = self.model.input_transform(data, transpose=False)
+                        observation = _model_lib.Observation.from_dict(observation_dict)
+
+                        # Shared a_cond mask across all forwards (avoids leaking via KL anchor).
+                        a_cond = self.model._sample_action_cond(x_0)
+
+                        # v_theta — current policy with grad
+                        with self.amp_context:
+                            v_theta = self.model.get_velocity_for_oar(
+                                observation, x_t, t_sample,
+                                action_cond=a_cond, compute_grad=True,
+                            )
+
+                        # v_old / v_ref — aliased single forward (matches DiffusionNFT
+                        # paper code in LoRA setting). Source per reference_mode:
+                        #   "v_old"        -> use self.ref_model (frozen at init)
+                        #   "lora_disable" -> use self.model with adapters disabled
+                        with torch.no_grad():
+                            if ref_mode == "lora_disable":
+                                with self.model.disable_adapter():
+                                    v_old = self.model.get_velocity_for_oar(
+                                        observation, x_t, t_sample, action_cond=a_cond,
+                                    )
+                            else:
+                                if self.ref_model is None:
+                                    raise ValueError(
+                                        "diffusion_nft.reference_mode='v_old' needs self.ref_model "
+                                        "(set algorithm.kl_beta>0 or use a *.startswith('nft') loss "
+                                        "to ensure the ref model is allocated at init)."
+                                    )
+                                v_old = self.ref_model.get_velocity_for_oar(
+                                    observation, x_t, t_sample, action_cond=a_cond,
+                                )
+                        v_ref = v_old  # alias; same tensor per the paper's LoRA-setting choice
+
+                        advantages = data["advantages"]
+                        if advantages.dim() > 1:
+                            # advantages may arrive as [B, T] or [T, B]; reduce to per-sample [B].
+                            advantages = advantages.reshape(bsz, -1).mean(dim=-1)
+
+                        loss, metrics_data = policy_loss(
+                            loss_type=self.cfg.algorithm.loss_type,
+                            task_type=self.cfg.runner.task_type,
+                            v_theta=v_theta,
+                            v_old=v_old,
+                            v_ref=v_ref,
+                            x_t=x_t,
+                            x_0=x_0,
+                            t=t_sample,
+                            advantages=advantages,
+                            beta=beta,
+                            kl_beta=kl_beta,
+                            adv_clip_max=adv_clip_max,
+                            critic_warmup=self._is_in_critic_warmup(),
+                        )
+                    elif self.cfg.algorithm.loss_type.startswith("nft"):
                         v_old = data.get("nft_v", None)
                         x_t_input = data.get("nft_xt", None)
                         x_next_input = data.get("nft_xnext", None)

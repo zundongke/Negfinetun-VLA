@@ -1093,6 +1093,88 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             x_t_std = step_result.std
         return x_t_mean, x_t_std, value_t
 
+    @torch.no_grad()
+    def get_velocity_for_oar(
+        self,
+        observation: "_model.Observation",
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        action_cond: Optional[torch.Tensor] = None,
+        compute_grad: bool = False,
+    ) -> torch.Tensor:
+        """One-shot velocity forward: `f_θ(o, x_t, t, a_cond)` for the DiffusionNFT loss.
+
+        Combines `embed_prefix` + paligemma KV cache + `get_velocity` into a
+        single entrypoint so the actor worker doesn't need to reach into
+        per-step internals. Returns `v_theta` of shape [B, H, action_dim].
+
+        Set ``compute_grad=True`` to enable autograd (the default ``@torch.no_grad``
+        decorator is bypassed via an explicit ``torch.enable_grad()`` context).
+        """
+        ctx = torch.enable_grad() if compute_grad else torch.no_grad()
+        with ctx:
+            images, img_masks, lang_tokens, lang_masks, state = (
+                self._preprocess_observation(observation, train=False)
+            )
+            device = state.device
+            images = [img.to(device) for img in images]
+            img_masks = [m.to(device) for m in img_masks]
+
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks
+            )
+            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = (
+                "eager"  # noqa: SLF001
+            )
+
+            (_, _), past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
+
+            v_t, _ = self.get_velocity(
+                state=state,
+                x_t=x_t,
+                timestep=t,
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                action_cond=action_cond,
+            )
+            v_t = v_t[:, : self.config.action_chunk, :]
+        return v_t
+
+    def disable_adapter(self):
+        """Context manager that disables LoRA adapters (paper-faithful reference forward).
+
+        Delegates to PEFT's ``disable_adapter()`` when the action expert wraps
+        a LoRA model. Raises ``ValueError`` when no LoRA is present — silent
+        fallback to identity would mask a config error.
+        """
+        # Try the most common entrypoints in order: PEFT-wrapped paligemma,
+        # PEFT-wrapped action expert (gemma_expert), or self.
+        for owner in (
+            getattr(self.paligemma_with_expert, "paligemma", None),
+            getattr(self.paligemma_with_expert, "gemma_expert", None),
+            self.paligemma_with_expert,
+            self,
+        ):
+            if owner is None:
+                continue
+            disable_fn = getattr(owner, "disable_adapter", None)
+            if callable(disable_fn):
+                return disable_fn()
+        raise ValueError(
+            "disable_adapter() requested but no PEFT LoRA found on the model. "
+            "Set actor.model.is_lora=true or use reference_mode='v_old' instead."
+        )
+
     def get_velocity(
         self,
         state,

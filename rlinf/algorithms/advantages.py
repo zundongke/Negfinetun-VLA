@@ -532,3 +532,138 @@ def compute_terminal_binary_advantages(
     )
 
     return advantages, returns
+
+
+@register_advantage("episode-task-norm")
+def compute_episode_task_norm_advantages(
+    rewards: torch.Tensor,
+    dones: Optional[torch.Tensor] = None,
+    truncations: Optional[torch.Tensor] = None,
+    task_ids: Optional[torch.Tensor] = None,
+    adv_clip_max: float = 1.0,
+    epsilon: float = 1e-4,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Episode-wise return, per-task standardized, broadcast to chunk-steps.
+
+    Implements the Q4-ii pipeline of the DiffusionNFT design (spec
+    2026-04-25 §3.5): walks the time-axis, assigns episode IDs from
+    ``done | truncations``, sums rewards per episode, standardizes within
+    each task group (or globally when task_ids is missing), and broadcasts
+    the resulting per-episode advantage to every chunk-step in that episode.
+
+    Inputs (typical wire shapes):
+        rewards:     [T, B] or [T, B, H]
+        dones:       [T, B] or [T, B, H]   (any True within H ends the episode)
+        truncations: [T, B] or [T, B, H]
+        task_ids:    None | [B] | [T, B]   (broadcast if rank-1)
+
+    Returns:
+        advantages: [T, B] standardized episode advantage broadcast to each chunk.
+                    Not yet clipped to [-adv_clip_max, +adv_clip_max] — the loss
+                    function performs that mapping (and the [0,1] r mapping).
+        returns:    [T, B] per-episode total return broadcast to each chunk.
+    """
+    if rewards.ndim == 3:
+        rewards_tb = rewards.sum(dim=-1)
+    elif rewards.ndim == 2:
+        rewards_tb = rewards
+    else:
+        raise ValueError(
+            f"compute_episode_task_norm_advantages: unsupported rewards shape {rewards.shape}"
+        )
+    time_len, batch_size = rewards_tb.shape
+    device = rewards_tb.device
+    dtype = rewards_tb.dtype
+
+    def _flatten_chunk(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if t is None:
+            return None
+        if t.ndim == 3:
+            return t.any(dim=-1)
+        return t
+
+    dones_tb = _flatten_chunk(dones)
+    truncs_tb = _flatten_chunk(truncations)
+    if dones_tb is None and truncs_tb is None:
+        boundary = torch.zeros((time_len, batch_size), dtype=torch.bool, device=device)
+    elif dones_tb is None:
+        boundary = truncs_tb.bool().to(device)
+    elif truncs_tb is None:
+        boundary = dones_tb.bool().to(device)
+    else:
+        boundary = (dones_tb.bool() | truncs_tb.bool()).to(device)
+
+    # Episode IDs per (t, b): increment when the previous step was a boundary.
+    # Walk the T axis (T is small — typically <100) so we can use a Python loop.
+    episode_id = torch.zeros((time_len, batch_size), dtype=torch.long, device=device)
+    counter = torch.zeros((batch_size,), dtype=torch.long, device=device)
+    for t in range(time_len):
+        if t > 0:
+            counter = counter + boundary[t - 1].long()
+        episode_id[t] = counter
+    n_episodes_per_b = counter + 1  # last counter+1 = number of episodes in that env
+    # Encode (b, episode_id) into a flat episode key for scatter aggregation.
+    max_episodes = int(n_episodes_per_b.max().item()) if batch_size > 0 else 1
+    episode_key = (
+        torch.arange(batch_size, device=device).view(1, batch_size) * max_episodes
+        + episode_id
+    )  # [T, B]
+    n_groups = int(batch_size * max_episodes)
+
+    # Per-episode return.
+    R = torch.zeros(n_groups, dtype=dtype, device=device)
+    R.scatter_add_(0, episode_key.reshape(-1), rewards_tb.reshape(-1))
+
+    # Per-episode task: take task_ids at the first step of the episode (constant within episode).
+    if task_ids is None:
+        task_per_ep = torch.zeros(n_groups, dtype=torch.long, device=device)
+    else:
+        if task_ids.ndim == 1:
+            tids_tb = task_ids.view(1, batch_size).expand(time_len, batch_size).to(device)
+        elif task_ids.ndim == 2:
+            tids_tb = task_ids.to(device)
+            if tids_tb.shape != (time_len, batch_size):
+                # Common case: shape [B, T] from per-step capture
+                if tids_tb.shape == (batch_size, time_len):
+                    tids_tb = tids_tb.transpose(0, 1)
+                else:
+                    raise ValueError(
+                        f"task_ids shape {tuple(task_ids.shape)} cannot align to (T={time_len}, B={batch_size})"
+                    )
+        else:
+            raise ValueError(f"task_ids must be 1D or 2D, got shape {tuple(task_ids.shape)}")
+        # First-step task per episode: scatter min over keys gives the earliest entry,
+        # but task is constant per episode so any entry works — use scatter_max for stability.
+        task_per_ep = torch.full((n_groups,), -1, dtype=torch.long, device=device)
+        task_per_ep.scatter_(0, episode_key.reshape(-1), tids_tb.reshape(-1).long())
+
+    # Per-episode flag: only count keys that actually correspond to a real episode.
+    valid = torch.zeros(n_groups, dtype=torch.bool, device=device)
+    valid.scatter_(0, episode_key.reshape(-1), torch.ones_like(episode_key.reshape(-1), dtype=torch.bool))
+
+    # Per-task standardize R[valid].
+    adv_per_ep = torch.zeros_like(R)
+    if task_ids is None:
+        if valid.any():
+            R_valid = R[valid]
+            mu = R_valid.mean()
+            sigma = R_valid.std() + epsilon
+            adv_per_ep[valid] = (R[valid] - mu) / sigma
+    else:
+        unique_tasks = task_per_ep[valid].unique()
+        for tg in unique_tasks.tolist():
+            group_mask = valid & (task_per_ep == tg)
+            if not group_mask.any():
+                continue
+            R_g = R[group_mask]
+            mu = R_g.mean()
+            sigma = R_g.std() + epsilon
+            adv_per_ep[group_mask] = (R_g - mu) / sigma
+
+    # Broadcast back to (T, B).
+    advantages = adv_per_ep.gather(0, episode_key.reshape(-1)).view(time_len, batch_size)
+    returns = R.gather(0, episode_key.reshape(-1)).view(time_len, batch_size)
+
+    # Note: clip and [0,1] mapping happen in the loss function, not here.
+    return advantages, returns

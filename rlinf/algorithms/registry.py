@@ -83,7 +83,10 @@ def policy_loss(**kwargs) -> tuple[torch.Tensor, dict]:
     loss_fn = get_policy_loss(loss_type)
 
     task_type = kwargs["task_type"]
-    skip_preprocess = loss_type.startswith("nft")
+    # NFT-family losses (incl. DiffusionNFT) operate on velocity/x_0 directly,
+    # not on logprobs, so they bypass the PPO-style preprocess that demands
+    # logprobs/old_logprobs.
+    skip_preprocess = loss_type.startswith("nft") or loss_type.startswith("diffusion-nft")
     if task_type == "embodied" and not skip_preprocess:
         kwargs = preprocess_loss_inputs(**kwargs)
 

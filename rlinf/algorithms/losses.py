@@ -568,3 +568,105 @@ def compute_nft_actor_critic_loss(**kwargs) -> tuple[torch.Tensor, dict]:
         metrics_data["critic/value_loss_total"] = critic_loss.detach()
 
     return total_loss, metrics_data
+
+
+@register_policy_loss("diffusion-nft-actor")
+def compute_diffusion_nft_actor_loss(
+    *,
+    v_theta: torch.Tensor,           # [B, H, action_dim]
+    v_old: torch.Tensor,             # [B, H, action_dim]
+    v_ref: torch.Tensor,             # [B, H, action_dim]  (== v_old.detach() if reference_mode='v_old')
+    x_t: torch.Tensor,               # [B, H, action_dim]  noised clean action at sampled t
+    x_0: torch.Tensor,               # [B, H, action_dim]  clean action chunk (target)
+    t: torch.Tensor,                 # [B]                  per-sample sampled time
+    advantages: torch.Tensor,        # [B] standardized episode advantage (from "episode-task-norm")
+    beta: float = 0.5,
+    kl_beta: float = 1e-4,
+    adv_clip_max: float = 1.0,
+    critic_warmup: bool = False,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """DiffusionNFT episode-wise loss (NVlabs ICLR 2026, adapted for action-conditioned VLA).
+
+    See spec docs/superpowers/specs/2026-04-25-diffusion-nft-loss-design.md §3.6:
+        positive_pred = β·v_θ + (1-β)·v_old.detach()
+        negative_pred = (1+β)·v_old.detach() - β·v_θ
+        x0_{pos,neg}  = x_t - t·{positive,negative}_pred
+        adaptive weights w_{pos,neg} = |x0_{pos,neg} - x_0|.mean(no-grad).clip(1e-5)
+        pos_loss = ((x0_pos - x_0)² / w_pos).mean
+        neg_loss = ((x0_neg - x_0)² / w_neg).mean
+        policy_loss = (r·pos_loss + (1-r)·neg_loss) / β · adv_clip_max
+        kl_loss     = ((v_θ - v_ref)²).mean
+        total       = policy_loss + kl_beta · kl_loss
+    """
+    if v_theta.shape != v_old.shape or v_theta.shape != v_ref.shape:
+        raise ValueError(
+            f"v_theta/v_old/v_ref shape mismatch: {v_theta.shape}, {v_old.shape}, {v_ref.shape}"
+        )
+    if x_t.shape != v_theta.shape or x_0.shape != v_theta.shape:
+        raise ValueError(
+            f"x_t/x_0 must match v_theta shape; got x_t={x_t.shape}, x_0={x_0.shape}, v_theta={v_theta.shape}"
+        )
+    if t.ndim != 1 or t.shape[0] != v_theta.shape[0]:
+        raise ValueError(
+            f"t must be shape [B]; got {tuple(t.shape)} vs v_theta batch {v_theta.shape[0]}"
+        )
+
+    v_old = v_old.detach()
+    v_ref = v_ref.detach()
+    t_bc = t.view(-1, *([1] * (v_theta.ndim - 1)))  # broadcast t to v shape
+
+    # Map advantages -> r ∈ [0, 1] (same convention as compute_nft_actor_loss)
+    advantages_clip = torch.clamp(advantages, -adv_clip_max, adv_clip_max)
+    r = torch.clamp(advantages_clip / adv_clip_max / 2.0 + 0.5, 0.0, 1.0)
+    r_bc = r.view(-1, *([1] * (v_theta.ndim - 1)))
+
+    # Asymmetric pos/neg predictions (DiffusionNFT eqn).
+    positive_pred = beta * v_theta + (1.0 - beta) * v_old
+    negative_pred = (1.0 + beta) * v_old - beta * v_theta
+
+    x0_pos = x_t - t_bc * positive_pred
+    x0_neg = x_t - t_bc * negative_pred
+
+    dims = tuple(range(1, v_theta.ndim))  # non-batch dims
+
+    with torch.no_grad():
+        w_pos = (
+            (x0_pos.detach() - x_0).abs().mean(dim=dims, keepdim=True).clamp(min=1e-5)
+        )
+        w_neg = (
+            (x0_neg.detach() - x_0).abs().mean(dim=dims, keepdim=True).clamp(min=1e-5)
+        )
+
+    pos_loss_per = ((x0_pos - x_0) ** 2 / w_pos).mean(dim=dims)  # [B]
+    neg_loss_per = ((x0_neg - x_0) ** 2 / w_neg).mean(dim=dims)  # [B]
+
+    policy_loss_per = (r * pos_loss_per + (1.0 - r) * neg_loss_per) / max(beta, 1e-6)
+    policy_loss = policy_loss_per.mean() * adv_clip_max
+
+    kl_loss_per = ((v_theta - v_ref) ** 2).mean(dim=dims)  # [B]
+    kl_loss = kl_loss_per.mean()
+
+    total_loss = policy_loss + kl_beta * kl_loss
+    if critic_warmup:
+        total_loss = torch.tensor(
+            0.0, device=total_loss.device, dtype=total_loss.dtype
+        )
+
+    with torch.no_grad():
+        r_sat_frac = ((r < 0.05) | (r > 0.95)).float().mean()
+        pos_neg_ratio = pos_loss_per.mean() / (neg_loss_per.mean() + 1e-8)
+
+    metrics = {
+        "actor/diffusion_nft_loss": policy_loss.detach(),
+        "actor/diffusion_nft_pos_loss": pos_loss_per.mean().detach(),
+        "actor/diffusion_nft_neg_loss": neg_loss_per.mean().detach(),
+        "actor/diffusion_nft_kl_loss": kl_loss.detach(),
+        "actor/diffusion_nft_total_loss": total_loss.detach(),
+        "actor/diffusion_nft_r_mean": r.mean().detach(),
+        "actor/diffusion_nft_r_sat_frac": r_sat_frac.detach(),
+        "actor/diffusion_nft_pos_neg_ratio": pos_neg_ratio.detach(),
+        "actor/diffusion_nft_w_pos_mean": w_pos.mean().detach(),
+        "actor/diffusion_nft_w_neg_mean": w_neg.mean().detach(),
+    }
+    return total_loss, metrics
