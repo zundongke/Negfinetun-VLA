@@ -28,6 +28,7 @@ from openpi.models_pytorch.pi0_pytorch import (
     PI0Pytorch,
     create_sinusoidal_pos_embedding,
     make_att_2d_masks,
+    sample_beta,
 )
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
@@ -206,15 +207,26 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 dtype=self.action_out_proj.weight.dtype
             )
 
-        # a_cond projection (zero-init for bit-for-bit fallback; see spec 2026-04-24 §3.3)
+        # a_cond projection: Ctrl-World Action_encoder2 (no text branch).
+        # 3-layer SiLU MLP, Kaiming-normal on the two hidden layers, PyTorch
+        # defaults elsewhere -- this matches Ctrl-World's init exactly and
+        # therefore breaks the bit-for-bit baseline equivalence of spec §3.3.
         if getattr(self.config, "action_cond_enabled", True):
             import torch.nn as _nn
             action_expert_width = self.action_in_proj.weight.shape[0]
-            self.action_cond_in_proj = _nn.Linear(
-                self.config.action_dim, action_expert_width
+            self.action_cond_in_proj = _nn.Sequential(
+                _nn.Linear(self.config.action_dim, action_expert_width),
+                _nn.SiLU(),
+                _nn.Linear(action_expert_width, action_expert_width),
+                _nn.SiLU(),
+                _nn.Linear(action_expert_width, action_expert_width),
             )
-            _nn.init.zeros_(self.action_cond_in_proj.weight)
-            _nn.init.zeros_(self.action_cond_in_proj.bias)
+            _nn.init.kaiming_normal_(
+                self.action_cond_in_proj[0].weight, mode="fan_in", nonlinearity="relu"
+            )
+            _nn.init.kaiming_normal_(
+                self.action_cond_in_proj[2].weight, mode="fan_in", nonlinearity="relu"
+            )
             self.action_cond_in_proj = self.action_cond_in_proj.to(
                 dtype=self.action_in_proj.weight.dtype,
                 device=self.action_in_proj.weight.device,
@@ -401,9 +413,50 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             raise NotImplementedError
 
     def sft_forward(self, data, **kwargs):
+        """Action-cond-aware flow-matching SFT loss (spec 2026-04-28 §3).
+
+        Upstream PI0Pytorch.forward calls ``embed_suffix(state, x_t, time)``
+        with no ``action_cond`` arg, so the a_cond port never receives a gradient
+        during SFT and stays dormant. We replicate the upstream flow-matching
+        objective but route the velocity prediction through ``get_velocity_for_oar``
+        with a CFG-dropped ``action_cond`` so ``action_cond_in_proj`` learns.
+        Returns the per-batch MSE (scalar).
+        """
         observation = data["observation"]
-        actions = data["actions"]
-        return super().forward(observation, actions)
+        actions = data["actions"]                         # [B, H, action_dim], clean x_0
+
+        # CFG-style dropout on a_cond (50% zeros / 50% clean.detach()).
+        action_cond = self._sample_action_cond(actions)
+
+        # The openpi+lerobot loader yields an already-constructed Observation pytree
+        # (jax.tree.map preserves the @struct.dataclass type when transforming leaves
+        # to torch tensors in FSDPSftWorker.run_training). For the RL path observation
+        # arrives as a flat-key dict and goes through input_transform first; SFT data
+        # bypasses that, so accept either form.
+        obs_obj = (
+            observation
+            if isinstance(observation, _model.Observation)
+            else _model.Observation.from_dict(observation)
+        )
+
+        # Standard flow-matching: sample t ~ Beta(1.5, 1.0) (matches upstream openpi),
+        # noise ~ N(0,I), x_t = (1-t) * x_0 + t * noise, target velocity = noise - x_0.
+        B = actions.shape[0]
+        device = actions.device
+        t = sample_beta(alpha=1.5, beta=1.0, bsize=B, device=device).clamp(1e-3, 1.0 - 1e-3)
+        noise = torch.randn_like(actions)
+        t_b = t[:, None, None]
+        x_t = (1.0 - t_b) * actions + t_b * noise
+        v_target = noise - actions
+
+        v_pred = self.get_velocity_for_oar(
+            observation=obs_obj,
+            x_t=x_t,
+            t=t,
+            action_cond=action_cond,
+            compute_grad=True,
+        )
+        return ((v_pred - v_target) ** 2).mean()
 
     def default_forward(
         self,
@@ -664,6 +717,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "observation/state": env_obs["states"],
             "tokenized_prompt": processed_obs["tokenized_prompt"],
             "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
+            # Model-space committed chunk (pre output_transform). Required as x_0
+            # by the DiffusionNFT loss path; harmless for PPO/NFT paths that
+            # already ignore unknown forward_inputs keys.
+            "action": outputs["actions"].detach(),
         }
         if "chains" in outputs:
             forward_inputs["chains"] = outputs["chains"]
@@ -687,6 +744,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "prev_logprobs": outputs["prev_logprobs"],
             "prev_values": outputs["prev_values"],
             "forward_inputs": forward_inputs,
+            # Expose the post-input_transform / post-precision observation so
+            # external value models (RISE-style) can score the same paligemma-
+            # format dict the actor saw, without re-running input_transform.
+            # Not stashed in the buffer — consumed inline in the rollout worker.
+            "processed_obs": processed_obs,
         }
         return actions, result
 
@@ -1102,6 +1164,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         *,
         action_cond: Optional[torch.Tensor] = None,
         compute_grad: bool = False,
+        truncate_to_chunk: bool = True,
     ) -> torch.Tensor:
         """One-shot velocity forward: `f_θ(o, x_t, t, a_cond)` for the DiffusionNFT loss.
 
@@ -1147,7 +1210,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 past_key_values=past_key_values,
                 action_cond=action_cond,
             )
-            v_t = v_t[:, : self.config.action_chunk, :]
+            if truncate_to_chunk:
+                v_t = v_t[:, : self.config.action_chunk, :]
         return v_t
 
     def disable_adapter(self):
@@ -1296,7 +1360,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 f"action_cond shape {tuple(action_cond.shape)} must match "
                 f"noisy_actions shape {tuple(noisy_actions.shape)}"
             )
-        if self.action_cond_in_proj.weight.dtype == torch.float32 and action_cond.dtype != torch.float32:
+        acond_proj_dtype = self.action_cond_in_proj[0].weight.dtype
+        if acond_proj_dtype == torch.float32 and action_cond.dtype != torch.float32:
             action_cond = action_cond.to(torch.float32)
 
         def acond_proj_func(a):

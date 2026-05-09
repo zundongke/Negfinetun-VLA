@@ -164,6 +164,66 @@ def nft_return_decay(
     return float(decay)
 
 
+_FSDP_WORKAROUND_INSTALLED = False
+
+
+def _install_fsdp_idle_assertion_workaround() -> None:
+    """Coerce FSDP handles to IDLE just before unsharding for state_dict.
+
+    The DiffusionNFT loss path runs multiple forward+backward passes per
+    optimizer step (v_theta + v_old + v_ref). Torch FSDP's post-backward
+    final callback isn't always invoked on every handle in this multi-backward
+    setup, so handles can be left in HandleTrainingState.BACKWARD_POST and the
+    next sync_model_to_rollout's _unshard_params_ctx crashes on:
+        AssertionError: Expects the handle training to be IDLE but got
+                       HandleTrainingState.BACKWARD_POST
+    Resetting the handle to IDLE before the assertion is safe: backward has
+    already finished (we torch.cuda.synchronize before the unshard) and we
+    only need the params for read-only state_dict consumption.
+
+    Idempotent: only installs the wrapper once per process.
+    """
+    global _FSDP_WORKAROUND_INSTALLED
+    if _FSDP_WORKAROUND_INSTALLED:
+        return
+    try:
+        import contextlib
+        import torch.distributed.fsdp._unshard_param_utils as _upu
+        import torch.distributed.fsdp._state_dict_utils as _sdu
+        from torch.distributed.fsdp._common_utils import (
+            HandleTrainingState as _HTS,
+            _module_handle,
+        )
+
+        _orig_fn = _upu._unshard_fsdp_state_params
+
+        @contextlib.contextmanager
+        def _patched(module, state, writeback, rank0_only, offload_to_cpu, with_grads):
+            handle = _module_handle(state, module)
+            if (
+                handle is not None
+                and handle._training_state != _HTS.IDLE
+                and handle._training_state != _HTS.SUMMON_FULL_PARAMS
+            ):
+                handle._training_state = _HTS.IDLE
+            with _orig_fn(module, state, writeback, rank0_only, offload_to_cpu, with_grads):
+                yield
+
+        # Patch in BOTH places: the source module and the state_dict_utils
+        # module that imports it via `from .. import _unshard_fsdp_state_params`
+        # (which creates an independent local binding).
+        _upu._unshard_fsdp_state_params = _patched
+        _sdu._unshard_fsdp_state_params = _patched
+        _FSDP_WORKAROUND_INSTALLED = True
+        print(
+            f"[fsdp-workaround] installed _unshard_fsdp_state_params patch in "
+            f"pid={os.getpid()} (rank={os.environ.get('LOCAL_RANK', '?')})",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[fsdp-workaround] install FAILED in pid={os.getpid()}: {e!r}", flush=True)
+
+
 def process_nested_dict_for_adv(nested_dict, rollout_epoch):
     """
     original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
@@ -372,6 +432,8 @@ class FSDPActor(FSDPModelManager, Worker):
         if self.enable_offload and self.is_weight_offloaded:
             self.load_param_and_grad(self.device, True)
 
+        torch.cuda.synchronize()
+        _install_fsdp_idle_assertion_workaround()
         self.rollout_state_dict = self.get_model_state_dict(
             cpu_offload=False, full_state_dict=True
         )
@@ -1320,6 +1382,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "[sync] value_head hard-copy skipped (training not started yet)"
                     )
 
+        # See note in the earlier sync_model_to_rollout: torch FSDP's
+        # state_dict path asserts handle._training_state == IDLE, but the
+        # DiffusionNFT loss leaves some handles in BACKWARD_POST. Install the
+        # workaround before any state_dict access.
+        torch.cuda.synchronize()
+        _install_fsdp_idle_assertion_workaround()
+
         if (
             self.cfg.algorithm.loss_type.startswith("nft")
             and self.ref_model is not None
@@ -1607,14 +1676,37 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             )
 
                         # Build x_0 from the committed action chunk on the wire.
-                        H = int(self.cfg.actor.model.num_action_chunks)
-                        action_dim = int(self.cfg.actor.model.action_dim)
+                        # forward_inputs["action"] is the model-space chunk produced by
+                        # openpi_action_model.predict_action_batch (pre output_transform),
+                        # flattened to the top level by EmbodiedRolloutResult.to_dict.
+                        # We use the buffered shape directly: the chunk horizon is the
+                        # openpi action_horizon (e.g. 10 for pi05_libero_spatial), which
+                        # is independent of cfg.actor.model.num_action_chunks (the env
+                        # interface stride). Trailing dim is the padded model_action_dim
+                        # (e.g. 32 for pi05), independent of cfg.actor.model.action_dim
+                        # (env-space, 7 for LIBERO).
                         x_0_flat = data["action"]
-                        if x_0_flat.dim() == 2 and x_0_flat.shape[1] == H * action_dim:
-                            x_0 = x_0_flat.reshape(x_0_flat.shape[0], H, action_dim)
+                        H_cfg = int(self.cfg.actor.model.num_action_chunks)
+                        if x_0_flat.dim() == 3:
+                            x_0 = x_0_flat
+                        elif x_0_flat.dim() == 2:
+                            assert x_0_flat.shape[1] % H_cfg == 0, (
+                                f"data['action'] shape {tuple(x_0_flat.shape)} not divisible by H={H_cfg}"
+                            )
+                            x_0 = x_0_flat.reshape(
+                                x_0_flat.shape[0], H_cfg, x_0_flat.shape[1] // H_cfg
+                            )
                         else:
-                            x_0 = x_0_flat.reshape(-1, H, action_dim)
-                        x_0 = x_0.to(dtype=torch.float32)
+                            raise ValueError(
+                                f"unexpected data['action'] shape {tuple(x_0_flat.shape)}"
+                            )
+                        # x_0 is at the model's full action_horizon (e.g. 10 for pi05_libero
+                        # _spatial). embed_suffix builds masks against action_horizon, so
+                        # x_t/x_0 must stay at the full horizon. We pass truncate_to_chunk
+                        # =False below so v_theta also comes back at full horizon.
+                        H = x_0.shape[1]
+                        action_dim = x_0.shape[-1]
+                        x_0 = x_0.to(dtype=torch.float32).contiguous()
                         bsz = x_0.shape[0]
 
                         # Fresh forward-process noising: t ~ U(eps, 1-eps), x_t = (1-t)·x_0 + t·noise
@@ -1629,8 +1721,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         x_t = (1.0 - t_bc) * x_0 + t_bc * noise
 
                         # Build observation once; reuse for the three forwards.
-                        # The model's input_transform expects the same dict keys as forward_nft.
+                        # input_transform goes through a numpy roundtrip, so its output
+                        # tensors land on CPU — push them back to the actor's device
+                        # before constructing the Observation, otherwise downstream
+                        # GPU weights (siglip vision tower etc.) hit a CPU/CUDA mismatch.
                         observation_dict = self.model.input_transform(data, transpose=False)
+                        observation_dict = self.model.precision_processor(observation_dict)
                         observation = _model_lib.Observation.from_dict(observation_dict)
 
                         # Shared a_cond mask across all forwards (avoids leaking via KL anchor).
@@ -1641,6 +1737,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             v_theta = self.model.get_velocity_for_oar(
                                 observation, x_t, t_sample,
                                 action_cond=a_cond, compute_grad=True,
+                                truncate_to_chunk=False,
                             )
 
                         # v_old / v_ref — aliased single forward (matches DiffusionNFT
@@ -1652,6 +1749,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                 with self.model.disable_adapter():
                                     v_old = self.model.get_velocity_for_oar(
                                         observation, x_t, t_sample, action_cond=a_cond,
+                                        truncate_to_chunk=False,
                                     )
                             else:
                                 if self.ref_model is None:
@@ -1662,6 +1760,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                     )
                                 v_old = self.ref_model.get_velocity_for_oar(
                                     observation, x_t, t_sample, action_cond=a_cond,
+                                    truncate_to_chunk=False,
                                 )
                         v_ref = v_old  # alias; same tensor per the paper's LoRA-setting choice
 

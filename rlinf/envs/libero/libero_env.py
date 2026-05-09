@@ -19,6 +19,16 @@ from typing import Optional, Union
 import gym
 import numpy as np
 import torch
+
+# LIBERO calls torch.load() on pickled task init states (numpy arrays). PyTorch 2.6
+# defaults weights_only=True, which rejects numpy globals. Restore the old default
+# before importing LIBERO so its loads keep working.
+_orig_torch_load = torch.load
+def _torch_load_compat(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _torch_load_compat
+
 from libero.libero import get_libero_path
 from libero.libero.benchmark import Benchmark
 from libero.libero.envs import OffScreenRenderEnv

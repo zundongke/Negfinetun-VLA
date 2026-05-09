@@ -15,6 +15,7 @@
 import copy
 import gc
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -86,10 +87,24 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
-            model_dict = torch.load(self.cfg.runner.ckpt_path)
+            model_dict = torch.load(self.cfg.runner.ckpt_path, weights_only=False, map_location="cpu")
             self.hf_model.load_state_dict(model_dict)
 
         self.hf_model.eval()
+
+        # Optional RISE-style external value model: provides V(s) per rollout step
+        # when the actor itself has no value head. Configured via
+        # cfg.runner.value_model_path. Output is plumbed into result["prev_values"]
+        # so existing GAE / value-bootstrap advantage code paths consume it.
+        self.value_model = None
+        value_ckpt = self.cfg.runner.get("value_model_path", None)
+        if value_ckpt:
+            from rlinf.models.value.rise_value_model import RiseValueModel
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self.value_model = RiseValueModel(
+                ckpt_path=value_ckpt,
+                device=f"cuda:{local_rank}",
+            )
 
         self.setup_sample_params()
         if self.enable_offload:
@@ -150,6 +165,23 @@ class MultiStepRolloutWorker(Worker):
                 forward_inputs = result.get("forward_inputs", {})
                 forward_inputs["task_ids"] = torch.as_tensor(task_ids)
                 result["forward_inputs"] = forward_inputs
+
+            # External value bootstrap: when the actor has no value head, score
+            # the current observation with the trained RISE value model so that
+            # GAE / value-as-score advantages get a real signal instead of zeros.
+            if self.value_model is not None:
+                # Use the actor's post-input_transform observation (paligemma
+                # format with image dict, padded state, tokenized prompt). The
+                # value model is the same architecture so it consumes the same
+                # schema; saves us re-running input_transform.
+                v = self.value_model.forward(result["processed_obs"])  # [B] CPU fp32
+                # GAE preprocessing collapses chunk-level rewards to chunk_size=1
+                # (rlinf/algorithms/utils.py:91-93), so values must follow the
+                # same convention: one V(s_t) per chunk-step, shape [B, 1].
+                result["prev_values"] = v.view(-1, 1).contiguous()
+            # processed_obs is consumed inline; drop before the result is
+            # passed downstream into the buffer.
+            result.pop("processed_obs", None)
 
         return actions, result
 
