@@ -62,9 +62,9 @@ algorithm:
   diffusion_nft:
     beta: 0.5
     adv_clip_max: 1.0
-    kl_beta: 1.0e-4
+    kl_beta: 1.0e-2  # v13: bumped 100x from 1e-4 to anchor the policy closer to SFT prior
     reference_mode: v_old
-  kl_beta: 1.0e-4
+  kl_beta: 1.0e-2    # v13: same bump for global KL accounting
 
   normalize_advantages: True
   kl_penalty: kl

@@ -1,0 +1,47 @@
+env_type: worldmodel
+simulator_name: opensora_stdit3
+task_suite_name: libero_spatial
+
+seed: 0
+total_num_envs: null
+auto_reset: True
+ignore_terminations: True
+max_steps_per_rollout_epoch: 240
+max_episode_steps: 240
+
+use_rel_reward: True
+reward_coef: 1.0
+use_fixed_reset_state_ids: True
+
+group_size: 1
+num_envs: 1
+
+# 4 imagined frames per rlinf step (= pad_action_num); the WM generates 12 latent
+# frames per forward and we return the last 4 as "next obs".
+gen_num_image_each_step: 4
+
+video_cfg:
+  save_video: False
+  info_on_video: False
+  video_base_dir: ./video/train
+
+dataset_cfg:
+  kind: opensora_libero
+  dataset_dir: ${oc.env:REPO_PATH}/models/opensora_libero_spatial/dataset
+  camera_names: ["image_primary"]
+  action_dim: 7
+
+backend_cfg:
+  # NOTE: when this yaml is loaded via `defaults: env/X@env.train`, sibling
+  # interpolations like ${num_envs} fail (no top-level `num_envs` after composition).
+  # Keep these literal — overridable from the parent yaml's env.train.* block.
+  batch_size: 1
+  num_prompt_frames: 1
+  max_episode_steps: 240
+  gen_num_image_each_step: 4
+  opensora:
+    checkpoint_dir: ${oc.env:REPO_PATH}/models/opensora_libero_spatial
+    text_embeddings_path: ${oc.env:REPO_PATH}/models/opensora_libero_spatial/text_embeddings.pt
+    num_latent_frames: 12
+    num_sampling_steps: 30  # v13: restored to OpenSora trained default — narrows the WM-real frame visual gap that V/RM see at inference
+    success_threshold: 0.9
