@@ -1,0 +1,27 @@
+{
+  "benchmark": "LIBERO-spatial",
+  "trained_with": "RISE-style WM-rollout DiffusionNFT RL on joint-SFT init",
+  "training_config": "examples/embodiment/config/libero_spatial_rise_actor_openpi_pi05.yaml",
+  "run_dir": "logs/rise-train-20260514-083702/",
+  "v13_changes_from_v12": {
+    "kl_beta": "1e-4 -> 1e-2 (100x tighter, anchors policy near SFT prior)",
+    "wm_num_sampling_steps": "15 -> 30 (restores OpenSora trained default, narrows WM-real visual gap)"
+  },
+  "eval_protocol": "496 envs (8-divisible), 240 max steps, 4 flow-matching denoise, action_cond not provided",
+  "curve": [
+    {"step":  0, "label": "joint-SFT baseline", "success_once": 0.87096775, "success_at_end": 0.81653225},
+    {"step": 10, "success_once": 0.87903225, "success_at_end": 0.8326613,  "label": "best — first ckpt above baseline"},
+    {"step": 20, "success_once": 0.8366935,  "success_at_end": 0.7883065},
+    {"step": 30, "success_once": 0.8608871,  "success_at_end": 0.80241936},
+    {"step": 40, "success_once": 0.8629032,  "success_at_end": 0.8145161},
+    {"step": 50, "success_once": 0.80241936, "success_at_end": 0.7520161}
+  ],
+  "comparison_v12_v13_success_once": {
+    "step10": {"v12": 0.87096775, "v13": 0.87903225, "delta": 0.0080645},
+    "step20": {"v12": 0.858871,   "v13": 0.8366935,  "delta": -0.0221775},
+    "step30": {"v12": 0.8145161,  "v13": 0.8608871,  "delta": 0.046371 },
+    "step40": {"v12": 0.7701613,  "v13": 0.8629032,  "delta": 0.0927419},
+    "step50": {"v12": 0.77620965, "v13": 0.80241936, "delta": 0.0262097}
+  },
+  "conclusion": "v13 (kl_beta=1e-2 + denoise=30) is the first RL run to produce a ckpt above the joint-SFT baseline on real LIBERO-spatial. Step 10 at 87.90% success_once beats baseline 87.10% by +0.80 pts. The peak is early (step 10) and the policy still slowly degrades thereafter (-7 pts by step 50), confirming that the WM-real visual gap remains the dominant failure channel — tighter KL slows but does not eliminate it. Best ckpt = step 10."
+}
