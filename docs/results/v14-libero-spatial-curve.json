@@ -1,0 +1,18 @@
+{
+  "benchmark": "LIBERO-spatial",
+  "trained_with": "RISE-style WM-rollout DiffusionNFT RL on v13/global_step_10 init (the best v13 ckpt)",
+  "training_config": "examples/embodiment/config/libero_spatial_rise_actor_openpi_pi05.yaml",
+  "run_dir": "logs/rise-train-v14-20260519-143807/",
+  "v14_difference_from_v13": "ckpt_path = v13/global_step_10 (instead of joint-SFT). Otherwise identical: kl_beta=1e-2, denoise=30, rollout_epoch=4, 50 steps.",
+  "eval_protocol": "496 envs (8-divisible), 240 max steps, 4 flow-matching denoise, action_cond not provided",
+  "curve": [
+    {"step":  0, "label": "joint-SFT baseline",        "success_once": 0.87096775, "success_at_end": 0.81653225},
+    {"step": "v13-step-10", "label": "v14 init point", "success_once": 0.87903225, "success_at_end": 0.8326613},
+    {"step": 10, "success_once": 0.86491936, "success_at_end": 0.80846775},
+    {"step": 20, "success_once": 0.858871,   "success_at_end": 0.8064516},
+    {"step": 30, "success_once": 0.8548387,  "success_at_end": 0.8044355},
+    {"step": 40, "success_once": 0.8407258,  "success_at_end": 0.796371},
+    {"step": 50, "success_once": 0.7822581,  "success_at_end": 0.71370965}
+  ],
+  "conclusion": "v14 confirms that continuing training from v13's best ckpt (87.90 success_once) drifts monotonically down, ending at 78.23 by step 50. Not even the first ckpt at step 10 (86.49) was as high as the init. So the v13/step_10 peak was an unstable lucky point on the WM-RL landscape — more RL doesn't extend it. v13/step_10 remains the global SOTA across all experiments (joint-SFT, v12, v13, v14)."
+}
